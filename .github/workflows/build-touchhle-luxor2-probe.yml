@@ -1,8 +1,7 @@
 name: build-touchhle-luxor2-probe
 
 # Probe: build touchHLE (emulator iPhone OS) untuk Linux aarch64 (Anbernic/muOS),
-# lalu coba jalankan Luxor_2_HD.ipa di device. BELUM TERVERIFIKASI, kemungkinan
-# besar perlu iterasi (dependency / glibc / dukungan iPad 3.2 di touchHLE).
+# lalu coba jalankan Luxor_2_HD.ipa di device. BELUM TERVERIFIKASI.
 
 on:
   workflow_dispatch:
@@ -31,25 +30,52 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build release
-        run: cargo build --release 2>&1 | tee build_log.txt
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo build --release 2>&1 | tee build_log.txt
+
+      - name: Debug - lihat hasil build
+        if: always()
+        run: |
+          echo "=== 40 baris terakhir build log ==="
+          tail -n 40 build_log.txt || true
+          echo "=== isi target/ ==="
+          ls -la target/ || true
+          echo "=== file executable di target/ ==="
+          find target -maxdepth 3 -type f -executable \
+            ! -name '*.so' ! -name '*.d' ! -name 'build-script-*' | head -30 || true
 
       - name: Package
+        shell: bash
         run: |
           set -x
           mkdir -p out/touchHLE/touchHLE_apps
-          cp target/release/touchHLE out/touchHLE/
-          cp -r touchHLE_dylibs out/touchHLE/
-          cp -r touchHLE_fonts out/touchHLE/
-          cp touchHLE_default_options.txt out/touchHLE/
+
+          BIN=$(find target -maxdepth 3 -type f -executable \
+                  -iname 'touchhle' -path '*release*' | head -1)
+          echo "Binary ditemukan: $BIN"
+          if [ -z "$BIN" ]; then
+            echo "Binary tidak ditemukan, cek langkah Build release / Debug"
+            exit 1
+          fi
+          cp "$BIN" out/touchHLE/touchHLE
+
+          cp -r touchHLE_dylibs out/touchHLE/ 2>/dev/null || true
+          cp -r touchHLE_fonts out/touchHLE/ 2>/dev/null || true
+          cp touchHLE_default_options.txt out/touchHLE/ 2>/dev/null || true
           cp touchHLE_options.txt out/touchHLE/ 2>/dev/null || true
           cp OPTIONS_HELP.txt out/touchHLE/ 2>/dev/null || true
           cp build_log.txt out/
+
           file out/touchHLE/touchHLE
           ldd out/touchHLE/touchHLE || true
           ldd --version | head -1
 
       - name: Upload artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: touchhle-aarch64-linux
           path: out/
+          if-no-files-found: warn
