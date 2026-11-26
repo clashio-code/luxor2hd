@@ -805,6 +805,9 @@ jobs:
             *out = v; return s;
           }
           static int p_dec(const char *s) { int v = 0; while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0'); return v; }
+          /* pengganti atoi (atoi -> __isoc23_strtol@GLIBC_2.38 di toolchain baru; device hanya 2.37) */
+          static double strtod_(const char *s) { return strtod(s, NULL); }
+          static int p_int(const char *s) { int neg = 0; while (*s == ' ' || *s == '\t') s++; if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++; return neg ? -p_dec(s) : p_dec(s); }
 
           /* ============================================================ shim: Darwin ctype */
           typedef struct { uint32_t nranges; void *ranges; } RuneRange;
@@ -912,7 +915,7 @@ jobs:
           static double (*p_ldexp)(double, int);
           SOFTFP static double sh_ldexp(double x, int e) { return p_ldexp ? p_ldexp(x, e) : 0.0; }
           SOFTFP static double sh_strtod(const char *s, char **e) { return strtod(s, e); }
-          SOFTFP static double sh_atof(const char *s) { return atof(s); }
+          SOFTFP static double sh_atof(const char *s) { return strtod(s, NULL); }
           static int g_math_missing;
           #define INIT_MATH(n) p_##n = (__typeof__(p_##n))dlsym(RTLD_DEFAULT, #n); if (!p_##n) { g_math_missing++; L("PERINGATAN: libm tidak punya %s\n", #n); }
           static void init_math(void) {
@@ -1266,8 +1269,8 @@ jobs:
             if (e && *e) snprintf(g_app_dir, sizeof g_app_dir, "%s", e); else snprintf(g_app_dir, sizeof g_app_dir, "%s/bin", cwd);
             snprintf(g_save_dir, sizeof g_save_dir, "%s/save", cwd);
             mkdir(g_save_dir, 0755);
-            if (w && atoi(w) > 0) g_scr_w = atoi(w);
-            if (h && atoi(h) > 0) g_scr_h = atoi(h);
+            if (w && p_int(w) > 0) g_scr_w = p_int(w);
+            if (h && p_int(h) > 0) g_scr_h = p_int(h);
             L("[paths] app=%s save=%s layar=%dx%d\n", g_app_dir, g_save_dir, g_scr_w, g_scr_h);
           }
 
@@ -1416,10 +1419,10 @@ jobs:
           NAT(nat_str_delext) { char buf[1024]; const char *s = S(self), *sl = strrchr(s, '/'), *d = strrchr(s, '.'); size_t n = (d && (!sl || d > sl)) ? (size_t)(d - s) : strlen(s); if (n >= sizeof buf) n = sizeof buf - 1; memcpy(buf, s, n); buf[n] = 0; return mk_str(buf); }
           NAT(nat_str_lower) { char *c = strdup(S(self)), *p; U r; for (p = c; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32; r = mk_str(c); free(c); return r; }
           NAT(nat_str_upper) { char *c = strdup(S(self)), *p; U r; for (p = c; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32; r = mk_str(c); free(c); return r; }
-          NAT(nat_str_int) { return (U)atoi(S(self)); }
-          NAT(nat_str_bool) { const char *s = S(self); return (*s == 'Y' || *s == 'y' || *s == 'T' || *s == 't' || atoi(s) != 0); }
-          SOFTFP static float nat_str_float(U self, const char *sel) { return (float)atof(S(self)); }
-          SOFTFP static double nat_str_double(U self, const char *sel) { return atof(S(self)); }
+          NAT(nat_str_int) { return (U)p_int(S(self)); }
+          NAT(nat_str_bool) { const char *s = S(self); return (*s == 'Y' || *s == 'y' || *s == 'T' || *s == 't' || p_int(s) != 0); }
+          SOFTFP static float nat_str_float(U self, const char *sel) { return (float)strtod_(S(self)); }
+          SOFTFP static double nat_str_double(U self, const char *sel) { return strtod_(S(self)); }
           NAT(nat_str_copy) { return mk_str(S(self)); }
           NAT(nat_str_substrfrom) { const char *s = S(self); size_t l = strlen(s); return mk_str(a <= l ? s + a : ""); }
           NAT(nat_str_substrto) { const char *s = S(self); size_t l = strlen(s), n = a < l ? a : l; char *c = (char *)malloc(n + 1); U r; memcpy(c, s, n); c[n] = 0; r = mk_str(c); free(c); return r; }
@@ -1485,7 +1488,7 @@ jobs:
 
           /* ---- NSUserDefaults (kamus di memori) ---- */
           NAT(nat_ud_standard) { return singleton("NSUserDefaults"); }
-          NAT(nat_ud_int) { U v = dict_get(self, a); return is_num(v) ? (U)num_i(v) : (U)atoi(S(v)); }
+          NAT(nat_ud_int) { U v = dict_get(self, a); return is_num(v) ? (U)num_i(v) : (U)p_int(S(v)); }
           SOFTFP static float nat_ud_float(U self, const char *sel, U a) { U v = dict_get(self, a); return is_num(v) ? (float)num_d(v) : 0.0f; }
           NAT(nat_ud_setint) { dict_set(self, b, mk_num(0, (int32_t)a, (double)(int32_t)a)); return 0; }
           NAT(nat_ud_setbool) { dict_set(self, b, mk_num(3, a ? 1 : 0, a ? 1.0 : 0.0)); return 0; }
