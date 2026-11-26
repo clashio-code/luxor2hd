@@ -752,6 +752,34 @@ jobs:
           static int g_logfd = -1;
           static uint32_t entry_pc, entry_cpsr; static int have_entry;
 
+          /* ============================================================ panggil kode game dengan aman (r9!)
+           * iOS armv7: r9 = register scratch (callee boleh menimpa). Linux armhf: r9 = callee-saved, dipakai kompiler untuk variabel lokal.
+           * Tiap panggilan loader -> kode game WAJIB lewat call_game4 supaya r9 (dan r4, r12) dipulihkan. Argumen ke-5 (d) lewat stack. */
+          #ifdef __arm__
+          extern uint32_t call_game4(uintptr_t fn, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d);
+          __asm__(
+            ".text\n"
+            ".arm\n"
+            ".align 2\n"
+            ".global call_game4\n"
+            ".type call_game4, %function\n"
+            "call_game4:\n"
+            "  push {r4, r9, r12, lr}\n"
+            "  mov r12, r0\n"
+            "  mov r0, r1\n"
+            "  mov r1, r2\n"
+            "  mov r2, r3\n"
+            "  ldr r3, [sp, #16]\n"
+            "  blx r12\n"
+            "  pop {r4, r9, r12, lr}\n"
+            "  bx lr\n"
+          );
+          #else
+          static uint32_t call_game4(uintptr_t fn, uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) {
+            return ((uint32_t (*)(uintptr_t, uintptr_t, uintptr_t, uintptr_t))fn)(a, b, c, d);
+          }
+          #endif
+
           /* ============================================================ log */
           static void wr(int fd, const char *b, int n) { ssize_t r = write(fd, b, (size_t)n); (void)r; }
           static void L(const char *fmt, ...) {
@@ -903,7 +931,7 @@ jobs:
           static int sh_semaphore_destroy(uint32_t task, uint32_t sem) { sem_t *s = (sem_t *)(uintptr_t)sem; (void)task; if (s) { sem_destroy(s); free(s); } return 0; }
           static int sh_semaphore_signal(uint32_t sem) { sem_post((sem_t *)(uintptr_t)sem); return 0; }
           static int sh_semaphore_wait(uint32_t sem) { while (sem_wait((sem_t *)(uintptr_t)sem) != 0 && errno == EINTR) {} return 0; }
-          static void call_block(void *blk) { void (*fn)(void *) = *(void (**)(void *))((char *)blk + 12); fn(blk); }
+          static void call_block(void *blk) { uintptr_t fn = *(uintptr_t *)((char *)blk + 12); call_game4(fn, (uintptr_t)blk, 0, 0, 0); }
           static pthread_mutex_t g_once_mx;
           static void sh_dispatch_once(volatile long *pred, void *blk) {
             if (*pred == -1) return;
@@ -1178,7 +1206,7 @@ jobs:
             U imp;
             if (!self) return 0;
             imp = objc_lookup_cls_c(M32(self), sel, 0);
-            return ((U (*)(U, const char *, U, U))A2P(imp))(self, sel, a, b);
+            return call_game4((uintptr_t)imp, (uintptr_t)self, (uintptr_t)sel, (uintptr_t)a, (uintptr_t)b);
           }
 
           /* ---- method bawaan (NSObject + beberapa kelas) ---- */
@@ -1605,7 +1633,7 @@ jobs:
             if (sci && !sci->fake && !sci->is_meta) call_load(sci);
             cm = ci_of(M32(ci->cls));
             imp = cm ? list_find(cm->base, "load") : 0;
-            if (imp) { L("  +load %s (imp=0x%08x)\n", ci->name, imp & ~1u); ((void (*)(U, const char *))A2P(imp))(ci->cls, "load"); }
+            if (imp) { L("  +load %s (imp=0x%08x)\n", ci->name, imp & ~1u); call_game4((uintptr_t)imp, (uintptr_t)ci->cls, (uintptr_t)"load", 0, 0); }
           }
           static void objc_setup(int do_load) {
             const Sec *cl = find_sec("__objc_classlist"), *ct = find_sec("__objc_catlist");
@@ -1638,7 +1666,7 @@ jobs:
             for (i = 0; i < n; i++) { ClsInfo *ci = ci_of(M32(cl->addr + 4 * i)); if (ci) { call_load(ci); nloaded++; } }
             if (ct) for (i = 0; i < ct->size / 4; i++) {
               U cat = M32(ct->addr + 4 * i), cls = M32(cat + 4), cmth = M32(cat + 12), imp = list_find(cmth, "load");
-              if (imp) { L("  +load kategori %s (imp=0x%08x)\n", (const char *)A2P(M32(cat)), imp & ~1u); ((void (*)(U, const char *))A2P(imp))(cls, "load"); }
+              if (imp) { L("  +load kategori %s (imp=0x%08x)\n", (const char *)A2P(M32(cat)), imp & ~1u); call_game4((uintptr_t)imp, (uintptr_t)cls, (uintptr_t)"load", 0, 0); }
             }
             L("  +load selesai\n");
           }
@@ -1814,7 +1842,7 @@ jobs:
                   if (sk) { L("  ctor %3d/%d @0x%08x DILEWATI\n", i, n, a & ~1u); continue; }
                   g_cur_ctor = i;
                   L("  ctor %3d/%d @0x%08x%s ...\n", i, n, a & ~1u, (a & 1) ? " (thumb)" : "");
-                  ((void (*)(int, char **, char **, char **))(uintptr_t)a)(1, fake_argv, environ, fake_apple);
+                  call_game4((uintptr_t)a, 1, (uintptr_t)fake_argv, (uintptr_t)environ, (uintptr_t)fake_apple);
                 }
                 g_cur_ctor = -1; if (!do_run) alarm(0);
                 if (run) L("  semua %d konstruktor selesai tanpa crash\n", run);
