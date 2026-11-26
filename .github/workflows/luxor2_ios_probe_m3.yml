@@ -1,4 +1,4 @@
-name: build-armhf-luxor2-ios-diagnostic-m3
+name: build-armhf-luxor2-ios-diagnostic-m4
 on:
   workflow_dispatch:
   push:
@@ -1005,6 +1005,7 @@ jobs:
 
           #ifdef __arm__
           extern void stub_common(void);
+          extern void align_call(void);
           extern void sh_setjmp(void);
           extern void sh_longjmp(void);
           __asm__(
@@ -1021,6 +1022,25 @@ jobs:
             "  mov r0, #0\n"
             "  mov r1, #0\n"
             "  pop {r4, pc}\n"
+            ".align 2\n"
+            ".global align_call\n"
+            ".type align_call, %function\n"
+            "align_call:\n"
+            "  push {r4, r5, r6, lr}\n"
+            "  mov r4, sp\n"
+            "  add r5, sp, #16\n"
+            "  sub sp, sp, #64\n"
+            "  bic sp, sp, #7\n"
+            "  mov r6, #0\n"
+            "1:\n"
+            "  ldr lr, [r5, r6]\n"
+            "  str lr, [sp, r6]\n"
+            "  add r6, r6, #4\n"
+            "  cmp r6, #64\n"
+            "  blt 1b\n"
+            "  blx ip\n"
+            "  mov sp, r4\n"
+            "  pop {r4, r5, r6, pc}\n"
             ".align 2\n"
             ".global sh_setjmp\n"
             ".type sh_setjmp, %function\n"
@@ -1065,6 +1085,28 @@ jobs:
           #endif
             return g_thunks + (size_t)idx * THUNK_SZ;
           }
+          static int g_nalign;
+          static void *align_wrap(void *target) {
+          #ifdef __arm__
+            static int off = -1; int idx;
+            if (off < 0) off = getenv("LUXOR_NOALIGN") ? 1 : 0;
+            if (off || !target) return target;
+            idx = MAXSYM - 1 - g_nalign;
+            if (idx <= nstub + 1) return target;      /* kehabisan slot thunk: biarkan langsung */
+            {
+              uint32_t *w = (uint32_t *)(g_thunks + (size_t)idx * THUNK_SZ);
+              w[0] = 0xE59FC000u;                      /* ldr ip, [pc]      -> w[2] (target)     */
+              w[1] = 0xE59FF000u;                      /* ldr pc, [pc]      -> w[3] (align_call) */
+              w[2] = (uint32_t)(uintptr_t)target;
+              w[3] = (uint32_t)(uintptr_t)align_call;
+            }
+            g_nalign++;
+            return g_thunks + (size_t)idx * THUNK_SZ;
+          #else
+            return target;
+          #endif
+          }
+
           static void thunks_seal(void) {
           #ifdef __arm__
             __builtin___clear_cache((char *)g_thunks, (char *)g_thunks + g_thunk_bytes);
@@ -1867,14 +1909,14 @@ jobs:
             for (i = 0; pass_tab[i]; i++)
               if (!strcmp(pass_tab[i], name)) {
                 void *p = dlsym(RTLD_DEFAULT, name + 1);
-                if (p) { *how = H_PASS; return p; }
+                if (p) { *how = H_PASS; return align_wrap(p); }
                 L("PERINGATAN: %s ada di daftar PASS tapi dlsym gagal -> stub\n", name);
                 break;
               }
             { int hw = 0; void *q = resolve_objc(name, &hw); if (q) { *how = hw; return q; } }
             if (!strncmp(name, "_gl", 3) && name[3] >= 'A' && name[3] <= 'Z') {
               void *p = gl_sym(name + 1);
-              if (p) { *how = H_PASS; return p; }
+              if (p) { *how = H_PASS; return align_wrap(p); }
             }
             *how = H_STUB;
             return stub_for(name);
@@ -2076,6 +2118,20 @@ jobs:
               L("  pc=0x%08lx lr=0x%08lx sp=0x%08lx cpsr=0x%08lx (%s)\n", m->arm_pc, m->arm_lr, m->arm_sp, m->arm_cpsr, (m->arm_cpsr & 0x20) ? "Thumb" : "ARM");
               L("  r0=%08lx r1=%08lx r2=%08lx r3=%08lx r4=%08lx r5=%08lx r6=%08lx r7=%08lx\n", m->arm_r0, m->arm_r1, m->arm_r2, m->arm_r3, m->arm_r4, m->arm_r5, m->arm_r6, m->arm_r7);
               L("  r8=%08lx r9=%08lx r10=%08lx fp=%08lx ip=%08lx\n", m->arm_r8, m->arm_r9, m->arm_r10, m->arm_fp, m->arm_ip);
+              {
+                Dl_info di; unsigned long av[2]; int k;
+                av[0] = m->arm_pc; av[1] = m->arm_lr;
+                for (k = 0; k < 2; k++) {
+                  memset(&di, 0, sizeof di);
+                  if (dladdr((void *)av[k], &di) && di.dli_fname) {
+                    if (di.dli_sname) L("  %s = %s+0x%lx  [%s]\n", k ? "lr" : "pc", di.dli_sname, av[k] - (unsigned long)di.dli_saddr, di.dli_fname);
+                    else L("  %s di %s +0x%lx\n", k ? "lr" : "pc", di.dli_fname, av[k] - (unsigned long)di.dli_fbase);
+                  }
+                }
+                L("  sp&7=%lu (%s)\n", m->arm_sp & 7, (m->arm_sp & 7) ? "sp TIDAK 8-aligned" : "sp 8-aligned");
+                if (m->arm_cpsr & 0x20) L("  instruksi di pc (thumb): %04x %04x\n", ((unsigned short *)(m->arm_pc & ~1ul))[0], ((unsigned short *)(m->arm_pc & ~1ul))[1]);
+                else L("  instruksi di pc (arm): %08x\n", *(unsigned *)m->arm_pc);
+              }
               if (m->arm_pc >= img_lo && m->arm_pc < img_hi) L("  pc DI DALAM image game (alamat sama dengan Ghidra/IDA): 0x%08lx\n", m->arm_pc);
               if (m->arm_lr >= img_lo && m->arm_lr < img_hi) L("  lr di dalam image game: 0x%08lx\n", m->arm_lr);
             }
@@ -2111,7 +2167,7 @@ jobs:
             if (!bin) { fprintf(stderr, "pakai: %s <binary> [--log f] [--ctors N|all] [--skip i]... [--timeout detik] [--run] [--noload] [--trace N]\n", argv[0]); return 2; }
             if (logf) g_logfd = open(logf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
-            L("== machoload (Luxor 2 HD iOS, Milestone 2) ==\n");
+            L("== machoload (Luxor 2 HD iOS, Milestone 3, align-thunk) ==\n");
             L("sizeof(void*)=%u mode=%s\n", (unsigned)sizeof(void *), ctors ? "map+bind+ctors" : "map+bind (dry, tanpa menjalankan kode game)");
             f = fopen(bin, "rb");
             if (!f || fstat(fileno(f), &st) != 0) { L("GAGAL membuka %s\n", bin); return 1; }
@@ -2142,6 +2198,7 @@ jobs:
             for (i = 0; i < nusym; i++) { usyms[i].addr = resolve(usyms[i].name, &usyms[i].how); cnt_how[usyms[i].how]++; }
             L("  hasil resolusi: PASS(glibc langsung)=%d  WRAP(shim sendiri)=%d  DATA=%d  STUB(belum ada, dicatat saat dipanggil)=%d\n",
               cnt_how[H_PASS], cnt_how[H_WRAP], cnt_how[H_DATA], cnt_how[H_STUB]);
+            L("  PASS dibungkus align-thunk (sp 8-byte): %d%s\n", g_nalign, getenv("LUXOR_NOALIGN") ? "  [DIMATIKAN via LUXOR_NOALIGN]" : "");
             for (i = 0; i < nbinds; i++) {
               const BindRec *b = &binds[i]; const USym *u = &usyms[b->usym]; uint64_t v;
               if (b->kind == 2) { weak_skip++; continue; }
