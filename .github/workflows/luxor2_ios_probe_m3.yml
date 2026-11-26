@@ -1083,7 +1083,7 @@ jobs:
 
           static ClsInfo g_ci[MAXCI]; static int nci;
           static MCache g_mc[MC_N];
-          static U g_cfclass, g_app, g_delegate;
+          static U g_cfclass, g_strclass, g_app, g_delegate;
           static int g_trace_left = 400, g_unk_log, g_nil_log, g_sum_done;
           static U g_nilseen[512];
           static volatile U g_msg_self, g_msg_lr;
@@ -1127,25 +1127,37 @@ jobs:
             for (i = 0; i < nci; i++) if (!g_ci[i].is_meta && !strcmp(g_ci[i].name, name)) return g_ci[i].cls;
             return 0;
           }
-          /* kelas Apple palsu: semua turunan NSObject palsu; instance 128 byte */
+          /* kelas Apple palsu: induk lewat tabel (default NSObject); instance 128 byte */
+          static const char *fake_parent(const char *n) {
+            static const char *t[][2] = {
+              {"NSMutableString","NSString"},{"NSMutableDictionary","NSDictionary"},{"NSMutableArray","NSArray"},{"NSMutableData","NSData"},
+              {"__NSCFConstantString","NSString"},{"__NSCFString","NSString"},{"NSDecimalNumber","NSNumber"},
+              {"UIButton","UIView"},{"UITextField","UIView"},{"UIActivityIndicatorView","UIView"},{"UIWebView","UIView"},{"UIWindow","UIView"},
+              {"UINavigationController","UIViewController"},{"UITabBarController","UIViewController"},{"GKLeaderboardViewController","UIViewController"},
+              {"NSMutableURLRequest","NSURLRequest"},{"NSMutableCharacterSet","NSCharacterSet"},{"NSInvocationOperation","NSOperation"},{NULL,NULL}};
+            int k;
+            for (k = 0; t[k][0]; k++) if (!strcmp(t[k][0], n)) return t[k][1];
+            return "NSObject";
+          }
           static U fake_class(const char *name, int want_meta) {
-            U cls = class_by_name(name), meta, root, rootm; ClsInfo *a, *b; char *nm;
+            U cls = class_by_name(name), meta; ClsInfo *a, *b; char *nm;
             if (cls) return want_meta ? M32(cls) : cls;
             nm = strdup(name);
             cls = P2A(calloc(8, 4)); meta = P2A(calloc(8, 4));
-            if (!strcmp(name, "NSObject")) { root = cls; rootm = meta; }
-            else { root = fake_class("NSObject", 0); rootm = M32(root); }
-            M32(cls) = meta; M32(meta) = rootm;
-            M32(cls + 4) = (cls == root) ? 0 : root;
-            M32(meta + 4) = (cls == root) ? cls : rootm;
+            if (!strcmp(name, "NSObject")) {
+              M32(cls) = meta; M32(meta) = meta; M32(cls + 4) = 0; M32(meta + 4) = cls;
+            } else {
+              U par = fake_class(fake_parent(name), 0), nso = fake_class("NSObject", 0);
+              M32(cls) = meta; M32(meta) = M32(nso); M32(cls + 4) = par; M32(meta + 4) = M32(par);
+            }
             a = ci_new(cls, nm, 0, 1); b = ci_new(meta, nm, 1, 1);
             a->instsize = 128; b->instsize = 128;
             return want_meta ? meta : cls;
           }
-          static void ensure_cf(void) { if (!g_cfclass) g_cfclass = fake_class("__NSCFConstantString", 0); }
+          static void ensure_cf(void) { if (!g_cfclass) { g_cfclass = fake_class("__NSCFConstantString", 0); g_strclass = fake_class("__NSCFString", 0); } }
           static const char *cfstr(U o) {
-            if (o < 0x1000 || (o & 3) || !g_cfclass || M32(o) != g_cfclass) return NULL;
-            if ((M32(o + 4) & 0xFF) != 0xC8) return NULL;     /* hanya string 8-bit ASCII */
+            if (o < 0x1000 || (o & 3)) return NULL;
+            if ((M32(o + 4) & 0xFFFF) != 0x7C8) return NULL;     /* penanda string 8-bit ASCII: flags 0x7C8 */
             return (const char *)A2P(M32(o + 8));
           }
           static U mk_cfstring(const char *s) {
@@ -1242,6 +1254,288 @@ jobs:
           static U nat_getdelegate(U self, const char *sel, U a, U b) { return g_delegate; }
           static U nat_setdelegate(U self, const char *sel, U a, U b) { g_delegate = a; return 0; }
 
+          /* ============================================================ Foundation/UIKit minimal (Milestone 4a) */
+          #define NAT(n) static U n(U self, const char *sel, U a, U b)
+          static char g_app_dir[512], g_save_dir[512];
+          static int g_scr_w = 1024, g_scr_h = 768;
+          static int g_dummy_mut;
+
+          static void init_paths(void) {
+            char cwd[400]; const char *e = getenv("LUXOR_APP_DIR"), *w = getenv("LUXOR_W"), *h = getenv("LUXOR_H");
+            if (!getcwd(cwd, sizeof cwd)) strcpy(cwd, ".");
+            if (e && *e) snprintf(g_app_dir, sizeof g_app_dir, "%s", e); else snprintf(g_app_dir, sizeof g_app_dir, "%s/bin", cwd);
+            snprintf(g_save_dir, sizeof g_save_dir, "%s/save", cwd);
+            mkdir(g_save_dir, 0755);
+            if (w && atoi(w) > 0) g_scr_w = atoi(w);
+            if (h && atoi(h) > 0) g_scr_h = atoi(h);
+            L("[paths] app=%s save=%s layar=%dx%d\n", g_app_dir, g_save_dir, g_scr_w, g_scr_h);
+          }
+
+          /* ---- objek dasar ---- */
+          static U mk_str(const char *s) {
+            U *c = (U *)calloc(4, 4); ensure_cf();
+            c[0] = g_strclass; c[1] = 0x7C8; c[2] = P2A(strdup(s ? s : "")); c[3] = (U)strlen(s ? s : "");
+            return P2A(c);
+          }
+          static void str_set(U o, const char *s) { U *c = (U *)A2P(o); c[1] = 0x7C8; c[2] = P2A(strdup(s ? s : "")); c[3] = (U)strlen(s ? s : ""); }
+          static int is_str(U o) { return cfstr(o) != NULL; }
+          static int is_num(U o) { ClsInfo *ci; if (o < 0x1000 || (o & 3)) return 0; ci = ci_of(M32(o)); return ci && !strcmp(ci->name, "NSNumber"); }
+          typedef struct { U isa, type; int32_t iv; U pad; double dv; } Num;
+          static U mk_num(int type, int32_t iv, double dv) {
+            Num *n = (Num *)calloc(1, sizeof(Num));
+            n->isa = fake_class("NSNumber", 0); n->type = (U)type; n->iv = iv; n->dv = dv;
+            return P2A(n);
+          }
+          static double num_d(U o) { Num *n = (Num *)A2P(o); return (n->type == 1 || n->type == 2) ? n->dv : (double)n->iv; }
+          static int32_t num_i(U o) { Num *n = (Num *)A2P(o); return (n->type == 1 || n->type == 2) ? (int32_t)n->dv : n->iv; }
+          static const char *obj_cstr(U o, char *tmp, size_t n) {
+            const char *s; ClsInfo *ci;
+            if (!o) return "(null)";
+            if ((s = cfstr(o))) return s;
+            if (is_num(o)) { Num *m = (Num *)A2P(o); if (m->type == 1 || m->type == 2) snprintf(tmp, n, "%g", m->dv); else snprintf(tmp, n, "%d", m->iv); return tmp; }
+            ci = ci_of((o & 3) || o < 0x1000 ? 0 : M32(o));
+            snprintf(tmp, n, "<%s: 0x%08x>", ci ? ci->name : "?", o);
+            return tmp;
+          }
+          static int obj_eq(U x, U y) {
+            const char *a, *b;
+            if (x == y) return 1;
+            if (!x || !y) return 0;
+            a = cfstr(x); b = cfstr(y);
+            if (a && b) return !strcmp(a, b);
+            if (is_num(x) && is_num(y)) return num_d(x) == num_d(y);
+            return 0;
+          }
+          /* koleksi: [0]=isa [1]=count [2]=cap [3]=items [4]=vals (dict) */
+          static U mk_coll_cls(U cls) { U *o = (U *)calloc(1, 32); o[0] = cls; return P2A(o); }
+          static U mk_coll(const char *cname) { return mk_coll_cls(fake_class(cname, 0)); }
+          static void coll_push(U o, U item, U val, int dict) {
+            U *c = (U *)A2P(o);
+            if (c[1] == c[2]) {
+              c[2] = c[2] ? c[2] * 2 : 8;
+              c[3] = P2A(realloc(A2P(c[3]), c[2] * 4));
+              if (dict) c[4] = P2A(realloc(A2P(c[4]), c[2] * 4));
+            }
+            ((U *)A2P(c[3]))[c[1]] = item;
+            if (dict) ((U *)A2P(c[4]))[c[1]] = val;
+            c[1]++;
+          }
+          static int coll_find(U o, U key) {
+            U *c = (U *)A2P(o); U *it = (U *)A2P(c[3]); U i;
+            for (i = 0; i < c[1]; i++) if (obj_eq(it[i], key)) return (int)i;
+            return -1;
+          }
+          static void dict_set(U o, U key, U val) {
+            int i = coll_find(o, key);
+            if (i >= 0) ((U *)A2P(((U *)A2P(o))[4]))[i] = val; else coll_push(o, key, val, 1);
+          }
+          static U dict_get(U o, U key) { int i = coll_find(o, key); return i >= 0 ? ((U *)A2P(((U *)A2P(o))[4]))[i] : 0; }
+          static U singleton(const char *cname) {
+            static struct { const char *n; U o; } t[16]; int i;
+            for (i = 0; i < 16 && t[i].n; i++) if (!strcmp(t[i].n, cname)) return t[i].o;
+            if (i >= 16) return 0;
+            t[i].n = cname; t[i].o = mk_coll(cname);
+            return t[i].o;
+          }
+
+          /* ---- format ala NSString ---- */
+          static void fmt_ns(char *out, size_t n, const char *f, va_list ap) {
+            size_t o = 0;
+            while (*f && o + 1 < n) {
+              char spec[32], t2[160]; int k = 0, ll = 0, r; const char *p = f; char c;
+              if (*f != '%') { out[o++] = *f++; continue; }
+              spec[k++] = *p++;
+              while (*p && strchr("-+ #0123456789.", *p) && k < 20) spec[k++] = *p++;
+              while (*p == 'l' || *p == 'h' || *p == 'z' || *p == 't' || *p == 'q') { if (*p == 'l' || *p == 'q') ll++; else if (*p == 'z' || *p == 't') ll = 1; p++; }
+              c = *p;
+              if (!c) break;
+              p++; f = p;
+              switch (c) {
+              case '%': out[o++] = '%'; break;
+              case '@': { const char *s = obj_cstr(va_arg(ap, U), t2, sizeof t2); r = snprintf(out + o, n - o, "%s", s); if (r > 0) o += (size_t)r; break; }
+              case 'd': case 'i':
+                if (ll >= 2) { long long v = va_arg(ap, long long); spec[k++] = 'l'; spec[k++] = 'l'; spec[k++] = 'd'; spec[k] = 0; r = snprintf(out + o, n - o, spec, v); }
+                else { int v = va_arg(ap, int); spec[k++] = 'd'; spec[k] = 0; r = snprintf(out + o, n - o, spec, v); }
+                if (r > 0) o += (size_t)r; break;
+              case 'u': case 'x': case 'X': case 'o':
+                if (ll >= 2) { unsigned long long v = va_arg(ap, unsigned long long); spec[k++] = 'l'; spec[k++] = 'l'; spec[k++] = c; spec[k] = 0; r = snprintf(out + o, n - o, spec, v); }
+                else { unsigned v = va_arg(ap, unsigned); spec[k++] = c; spec[k] = 0; r = snprintf(out + o, n - o, spec, v); }
+                if (r > 0) o += (size_t)r; break;
+              case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': { double v = va_arg(ap, double); spec[k++] = c; spec[k] = 0; r = snprintf(out + o, n - o, spec, v); if (r > 0) o += (size_t)r; break; }
+              case 's': { const char *s = va_arg(ap, const char *); spec[k++] = 's'; spec[k] = 0; r = snprintf(out + o, n - o, spec, s ? s : "(null)"); if (r > 0) o += (size_t)r; break; }
+              case 'c': { int v = va_arg(ap, int); out[o++] = (char)v; break; }
+              case 'p': { void *v = va_arg(ap, void *); r = snprintf(out + o, n - o, "%p", v); if (r > 0) o += (size_t)r; break; }
+              default: out[o++] = '%'; out[o++] = c; break;
+              }
+              if (o >= n) o = n - 1;
+            }
+            out[o < n ? o : n - 1] = 0;
+          }
+          static int sh_NSLog(U fmt, ...) {
+            char buf[1024]; va_list ap; const char *f = cfstr(fmt);
+            va_start(ap, fmt); fmt_ns(buf, sizeof buf, f ? f : "(format bukan string konstan)", ap); va_end(ap);
+            L("[NSLog] %s\n", buf);
+            return 0;
+          }
+
+          /* ---- NSString ---- */
+          static const char *S(U o) { const char *s = cfstr(o); return s ? s : ""; }
+          static U nat_str_fmt(U self, const char *sel, U fmt, ...) {
+            char buf[2048]; va_list ap; va_start(ap, fmt); fmt_ns(buf, sizeof buf, S(fmt), ap); va_end(ap);
+            return mk_str(buf);
+          }
+          static U nat_str_initfmt(U self, const char *sel, U fmt, ...) {
+            char buf[2048]; va_list ap; va_start(ap, fmt); fmt_ns(buf, sizeof buf, S(fmt), ap); va_end(ap);
+            str_set(self, buf); return self;
+          }
+          NAT(nat_str_empty) { return mk_str(""); }
+          NAT(nat_str_withstr) { return mk_str(S(a)); }
+          NAT(nat_str_withc) { return mk_str((const char *)A2P(a)); }
+          NAT(nat_str_init_empty) { str_set(self, ""); return self; }
+          NAT(nat_str_init_str) { str_set(self, S(a)); return self; }
+          NAT(nat_str_init_c) { str_set(self, a ? (const char *)A2P(a) : ""); return self; }
+          NAT(nat_str_utf8) { return P2A(cfstr(self)); }
+          NAT(nat_str_len) { return M32(self + 12); }
+          NAT(nat_str_iseq) { return obj_eq(self, a) ? 1 : 0; }
+          NAT(nat_str_hash) { const char *s = S(self); U h = 5381; while (*s) h = h * 33 + (U)(unsigned char)*s++; return h; }
+          NAT(nat_str_hasprefix) { const char *s = S(self), *p = S(a); return !strncmp(s, p, strlen(p)); }
+          NAT(nat_str_hassuffix) { const char *s = S(self), *p = S(a); size_t ls = strlen(s), lp = strlen(p); return lp <= ls && !strcmp(s + ls - lp, p); }
+          NAT(nat_str_append) { char *buf; const char *x = S(self), *y = S(a); size_t lx = strlen(x), ly = strlen(y);
+            if (M32(self) == g_cfclass) return mk_str(x);
+            buf = (char *)malloc(lx + ly + 1); memcpy(buf, x, lx); memcpy(buf + lx, y, ly + 1);
+            ((U *)A2P(self))[2] = P2A(buf); ((U *)A2P(self))[3] = (U)(lx + ly); return 0; }
+          NAT(nat_str_appended) { char *buf; const char *x = S(self), *y = S(a); U r; buf = (char *)malloc(strlen(x) + strlen(y) + 1); strcpy(buf, x); strcat(buf, y); r = mk_str(buf); free(buf); return r; }
+          NAT(nat_str_appendpath) {
+            char buf[1024]; const char *x = S(self), *y = S(a); size_t lx = strlen(x);
+            snprintf(buf, sizeof buf, "%s%s%s", x, (lx && x[lx - 1] != '/' && *y) ? "/" : "", y);
+            return mk_str(buf);
+          }
+          NAT(nat_str_lastpath) { const char *s = S(self), *p = strrchr(s, '/'); return mk_str(p ? p + 1 : s); }
+          NAT(nat_str_delpath) { char buf[1024]; const char *s = S(self), *p = strrchr(s, '/'); size_t n = p ? (size_t)(p - s) : 0; if (n >= sizeof buf) n = sizeof buf - 1; memcpy(buf, s, n); buf[n] = 0; return mk_str(buf); }
+          NAT(nat_str_ext) { const char *s = S(self), *sl = strrchr(s, '/'), *d = strrchr(s, '.'); return mk_str((d && (!sl || d > sl)) ? d + 1 : ""); }
+          NAT(nat_str_delext) { char buf[1024]; const char *s = S(self), *sl = strrchr(s, '/'), *d = strrchr(s, '.'); size_t n = (d && (!sl || d > sl)) ? (size_t)(d - s) : strlen(s); if (n >= sizeof buf) n = sizeof buf - 1; memcpy(buf, s, n); buf[n] = 0; return mk_str(buf); }
+          NAT(nat_str_lower) { char *c = strdup(S(self)), *p; U r; for (p = c; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32; r = mk_str(c); free(c); return r; }
+          NAT(nat_str_upper) { char *c = strdup(S(self)), *p; U r; for (p = c; *p; p++) if (*p >= 'a' && *p <= 'z') *p -= 32; r = mk_str(c); free(c); return r; }
+          NAT(nat_str_int) { return (U)atoi(S(self)); }
+          NAT(nat_str_bool) { const char *s = S(self); return (*s == 'Y' || *s == 'y' || *s == 'T' || *s == 't' || atoi(s) != 0); }
+          SOFTFP static float nat_str_float(U self, const char *sel) { return (float)atof(S(self)); }
+          SOFTFP static double nat_str_double(U self, const char *sel) { return atof(S(self)); }
+          NAT(nat_str_copy) { return mk_str(S(self)); }
+          NAT(nat_str_substrfrom) { const char *s = S(self); size_t l = strlen(s); return mk_str(a <= l ? s + a : ""); }
+          NAT(nat_str_substrto) { const char *s = S(self); size_t l = strlen(s), n = a < l ? a : l; char *c = (char *)malloc(n + 1); U r; memcpy(c, s, n); c[n] = 0; r = mk_str(c); free(c); return r; }
+          NAT(nat_str_charat) { const char *s = S(self); return a < strlen(s) ? (U)(unsigned char)s[a] : 0; }
+          static void nat_str_range(U ret, U self, const char *sel, U a) {
+            const char *s = S(self), *p = strstr(s, S(a)); U *r = (U *)A2P(ret);
+            if (p) { r[0] = (U)(p - s); r[1] = (U)strlen(S(a)); } else { r[0] = 0x7fffffffu; r[1] = 0; }
+          }
+          NAT(nat_str_split) {
+            U arr = mk_coll("NSMutableArray"); char *c = strdup(S(self)), *p = c, *q; const char *sep = S(a); size_t ls = strlen(sep);
+            if (!ls) { coll_push(arr, mk_str(c), 0, 0); free(c); return arr; }
+            while ((q = strstr(p, sep))) { *q = 0; coll_push(arr, mk_str(p), 0, 0); p = q + ls; }
+            coll_push(arr, mk_str(p), 0, 0); free(c);
+            return arr;
+          }
+          NAT(nat_desc) { char t[160]; return mk_str(obj_cstr(self, t, sizeof t)); }
+
+          /* ---- NSNumber ---- */
+          NAT(nat_num_int) { return mk_num(0, (int32_t)a, (double)(int32_t)a); }
+          NAT(nat_num_bool) { return mk_num(3, a ? 1 : 0, a ? 1.0 : 0.0); }
+          NAT(nat_num_float) { float f; memcpy(&f, &a, 4); return mk_num(1, 0, (double)f); }
+          NAT(nat_num_double) { double d; U w[2]; w[0] = a; w[1] = b; memcpy(&d, w, 8); return mk_num(2, 0, d); }
+          NAT(nat_num_getint) { return (U)num_i(self); }
+          SOFTFP static float nat_num_getfloat(U self, const char *sel) { return (float)num_d(self); }
+          SOFTFP static double nat_num_getdouble(U self, const char *sel) { return num_d(self); }
+          NAT(nat_num_iseq) { return is_num(a) && num_d(self) == num_d(a); }
+
+          /* ---- NSArray / NSDictionary ---- */
+          NAT(nat_coll_new) { return mk_coll_cls(self); }
+          static U nat_arr_withobjs(U self, const char *sel, U first, ...) {
+            va_list ap; U o = mk_coll_cls(self), x; va_start(ap, first);
+            for (x = first; x; x = va_arg(ap, U)) coll_push(o, x, 0, 0);
+            va_end(ap); return o;
+          }
+          NAT(nat_arr_withobj) { U o = mk_coll_cls(self); coll_push(o, a, 0, 0); return o; }
+          NAT(nat_coll_count) { return M32(self + 4); }
+          NAT(nat_arr_at) { U *c = (U *)A2P(self); if (a >= c[1]) { L("!! NSArray objectAtIndex:%u di luar batas (%u)\n", a, c[1]); abort(); } return ((U *)A2P(c[3]))[a]; }
+          NAT(nat_arr_last) { U *c = (U *)A2P(self); return c[1] ? ((U *)A2P(c[3]))[c[1] - 1] : 0; }
+          NAT(nat_arr_add) { coll_push(self, a, 0, 0); return 0; }
+          NAT(nat_arr_addall) { U *c = (U *)A2P(a); U i; for (i = 0; c && i < c[1]; i++) coll_push(self, ((U *)A2P(c[3]))[i], 0, 0); return 0; }
+          NAT(nat_arr_clear) { ((U *)A2P(self))[1] = 0; return 0; }
+          NAT(nat_arr_rmlast) { U *c = (U *)A2P(self); if (c[1]) c[1]--; return 0; }
+          NAT(nat_arr_rmat) { U *c = (U *)A2P(self); U *it = (U *)A2P(c[3]); U i; if (a >= c[1]) return 0; for (i = a; i + 1 < c[1]; i++) it[i] = it[i + 1]; c[1]--; return 0; }
+          NAT(nat_arr_rmobj) { int i = coll_find(self, a); if (i >= 0) nat_arr_rmat(self, sel, (U)i, 0); return 0; }
+          NAT(nat_arr_contains) { return coll_find(self, a) >= 0; }
+          NAT(nat_arr_indexof) { int i = coll_find(self, a); return i >= 0 ? (U)i : 0x7fffffffu; }
+          NAT(nat_coll_enum) {   /* for (x in coll): state[0]=0 awal, state[1]=itemsPtr, state[2]=mutationsPtr; kamus -> kunci */
+            U *st = (U *)A2P(a), *c = (U *)A2P(self);
+            if (st[0]) return 0;
+            st[0] = 1; st[1] = c[3]; st[2] = P2A(&g_dummy_mut);
+            return c[1];
+          }
+          static U nat_dict_withkv(U self, const char *sel, U first, ...) {
+            va_list ap; U o = mk_coll_cls(self), v, k; va_start(ap, first);
+            for (v = first; v; v = va_arg(ap, U)) { k = va_arg(ap, U); dict_set(o, k, v); }
+            va_end(ap); return o;
+          }
+          NAT(nat_dict_get) { return dict_get(self, a); }
+          NAT(nat_dict_set) { dict_set(self, b, a); return 0; }
+          NAT(nat_dict_rm) { int i = coll_find(self, a); U *c = (U *)A2P(self); U *it = (U *)A2P(c[3]), *vl = (U *)A2P(c[4]); U j; if (i < 0) return 0; for (j = (U)i; j + 1 < c[1]; j++) { it[j] = it[j + 1]; vl[j] = vl[j + 1]; } c[1]--; return 0; }
+          NAT(nat_dict_keys) { U *c = (U *)A2P(self); U o = mk_coll("NSMutableArray"), i; for (i = 0; i < c[1]; i++) coll_push(o, ((U *)A2P(c[3]))[i], 0, 0); return o; }
+          NAT(nat_dict_vals) { U *c = (U *)A2P(self); U o = mk_coll("NSMutableArray"), i; for (i = 0; i < c[1]; i++) coll_push(o, ((U *)A2P(c[4]))[i], 0, 0); return o; }
+
+          /* ---- NSUserDefaults (kamus di memori) ---- */
+          NAT(nat_ud_standard) { return singleton("NSUserDefaults"); }
+          NAT(nat_ud_int) { U v = dict_get(self, a); return is_num(v) ? (U)num_i(v) : (U)atoi(S(v)); }
+          SOFTFP static float nat_ud_float(U self, const char *sel, U a) { U v = dict_get(self, a); return is_num(v) ? (float)num_d(v) : 0.0f; }
+          NAT(nat_ud_setint) { dict_set(self, b, mk_num(0, (int32_t)a, (double)(int32_t)a)); return 0; }
+          NAT(nat_ud_setbool) { dict_set(self, b, mk_num(3, a ? 1 : 0, a ? 1.0 : 0.0)); return 0; }
+          NAT(nat_ud_setfloat) { float f; memcpy(&f, &a, 4); dict_set(self, b, mk_num(1, 0, (double)f)); return 0; }
+
+          /* ---- NSBundle / NSFileManager / path ---- */
+          NAT(nat_bundle_main) { return singleton("NSBundle"); }
+          NAT(nat_bundle_path) { return mk_str(g_app_dir); }
+          NAT(nat_bundle_info) {
+            static U d;
+            if (!d) {
+              d = mk_coll("NSMutableDictionary");
+              dict_set(d, mk_str("CFBundleIdentifier"), mk_str("com.bigfishgames.luxor2hd"));
+              dict_set(d, mk_str("CFBundleVersion"), mk_str("1.0"));
+              dict_set(d, mk_str("CFBundleShortVersionString"), mk_str("1.0"));
+              dict_set(d, mk_str("CFBundleDisplayName"), mk_str("Luxor 2 HD"));
+              dict_set(d, mk_str("CFBundleName"), mk_str("Luxor 2 HD"));
+              dict_set(d, mk_str("CFBundleExecutable"), mk_str("luxor2"));
+            }
+            return d;
+          }
+          NAT(nat_bundle_infokey) { return dict_get(nat_bundle_info(0, NULL, 0, 0), a); }
+          NAT(nat_bundle_id) { return dict_get(nat_bundle_info(0, NULL, 0, 0), mk_str("CFBundleIdentifier")); }
+          static U nat_bundle_res(U self, const char *sel, U name, U type, U dir) {
+            char buf[1024]; const char *t = S(type);
+            snprintf(buf, sizeof buf, "%s%s%s/%s%s%s", g_app_dir, (dir ? "/" : ""), (dir ? S(dir) : ""), S(name), *t ? "." : "", t);
+            if (access(buf, F_OK) == 0) return mk_str(buf);
+            if (g_unk_log < 800) { g_unk_log++; L("[res] tidak ditemukan: %s\n", buf); }
+            return 0;
+          }
+          NAT(nat_fm_default) { return singleton("NSFileManager"); }
+          NAT(nat_fm_exists) { return access(S(a), F_OK) == 0; }
+          static U sh_NSSearchPath(int dir, int domain, int expand) { U arr = mk_coll("NSMutableArray"); coll_push(arr, mk_str(g_save_dir), 0, 0); return arr; }
+          static U sh_NSTemporaryDirectory(void) { return mk_str("/tmp/"); }
+          static U sh_NSStringFromClass(U c) { ClsInfo *ci = ci_of(c); return mk_str(ci ? ci->name : "(null)"); }
+
+          /* ---- UIKit: layar, perangkat, EAGL ---- */
+          NAT(nat_singleton_screen) { return singleton("UIScreen"); }
+          NAT(nat_singleton_device) { return singleton("UIDevice"); }
+          NAT(nat_singleton_nc) { return singleton("NSNotificationCenter"); }
+          static void nat_screen_bounds(U ret, U self, const char *sel) { float *f = (float *)A2P(ret); f[0] = 0; f[1] = 0; f[2] = (float)g_scr_w; f[3] = (float)g_scr_h; }
+          SOFTFP static float nat_screen_scale(U self, const char *sel) { return 1.0f; }
+          NAT(nat_dev_ver) { return mk_str("5.1"); }
+          NAT(nat_dev_model) { return mk_str("iPad"); }
+          NAT(nat_dev_sysname) { return mk_str("iPhone OS"); }
+          NAT(nat_dev_uid) { return mk_str("0000000000000000000000000000000000000000"); }
+          NAT(nat_dev_idiom) { return 1; }
+          NAT(nat_locale_langs) { U arr = mk_coll("NSMutableArray"); coll_push(arr, mk_str("en"), 0, 0); return arr; }
+
+
           static const Nat nat_tab[] = {
             { NULL, "alloc", (void *)nat_alloc }, { NULL, "allocWithZone:", (void *)nat_alloc }, { NULL, "new", (void *)nat_new },
             { NULL, "init", (void *)nat_self }, { NULL, "retain", (void *)nat_self }, { NULL, "autorelease", (void *)nat_self },
@@ -1257,6 +1551,63 @@ jobs:
             { "__NSCFConstantString", "description", (void *)nat_self },
             { "UIApplication", "sharedApplication", (void *)nat_sharedapp }, { "UIApplication", "delegate", (void *)nat_getdelegate },
             { "UIApplication", "setDelegate:", (void *)nat_setdelegate },
+            { NULL, "version", (void *)nat_zero }, { NULL, "description", (void *)nat_desc }, { NULL, "debugDescription", (void *)nat_desc },
+            { "NSString", "string", (void *)nat_str_empty }, { "NSString", "stringWithString:", (void *)nat_str_withstr },
+            { "NSString", "stringWithUTF8String:", (void *)nat_str_withc }, { "NSString", "stringWithCString:encoding:", (void *)nat_str_withc },
+            { "NSString", "stringWithFormat:", (void *)nat_str_fmt }, { "NSString", "initWithFormat:", (void *)nat_str_initfmt },
+            { "NSString", "init", (void *)nat_str_init_empty }, { "NSString", "initWithString:", (void *)nat_str_init_str },
+            { "NSString", "initWithUTF8String:", (void *)nat_str_init_c }, { "NSString", "stringWithCapacity:", (void *)nat_str_empty },
+            { "NSString", "UTF8String", (void *)nat_str_utf8 }, { "NSString", "cString", (void *)nat_str_utf8 }, { "NSString", "cStringUsingEncoding:", (void *)nat_str_utf8 },
+            { "NSString", "fileSystemRepresentation", (void *)nat_str_utf8 },
+            { "NSString", "length", (void *)nat_str_len }, { "NSString", "isEqualToString:", (void *)nat_str_iseq }, { "NSString", "isEqual:", (void *)nat_str_iseq },
+            { "NSString", "hash", (void *)nat_str_hash }, { "NSString", "hasPrefix:", (void *)nat_str_hasprefix }, { "NSString", "hasSuffix:", (void *)nat_str_hassuffix },
+            { "NSString", "appendString:", (void *)nat_str_append }, { "NSString", "stringByAppendingString:", (void *)nat_str_appended },
+            { "NSString", "stringByAppendingPathComponent:", (void *)nat_str_appendpath }, { "NSString", "lastPathComponent", (void *)nat_str_lastpath },
+            { "NSString", "stringByDeletingLastPathComponent", (void *)nat_str_delpath }, { "NSString", "pathExtension", (void *)nat_str_ext },
+            { "NSString", "stringByDeletingPathExtension", (void *)nat_str_delext }, { "NSString", "lowercaseString", (void *)nat_str_lower },
+            { "NSString", "uppercaseString", (void *)nat_str_upper }, { "NSString", "intValue", (void *)nat_str_int }, { "NSString", "integerValue", (void *)nat_str_int },
+            { "NSString", "boolValue", (void *)nat_str_bool }, { "NSString", "floatValue", (void *)nat_str_float }, { "NSString", "doubleValue", (void *)nat_str_double },
+            { "NSString", "copy", (void *)nat_str_copy }, { "NSString", "mutableCopy", (void *)nat_str_copy }, { "NSString", "description", (void *)nat_self },
+            { "NSString", "substringFromIndex:", (void *)nat_str_substrfrom }, { "NSString", "substringToIndex:", (void *)nat_str_substrto },
+            { "NSString", "characterAtIndex:", (void *)nat_str_charat }, { "NSString", "rangeOfString:", (void *)nat_str_range },
+            { "NSString", "componentsSeparatedByString:", (void *)nat_str_split },
+            { "NSNumber", "numberWithInt:", (void *)nat_num_int }, { "NSNumber", "numberWithInteger:", (void *)nat_num_int }, { "NSNumber", "numberWithUnsignedInt:", (void *)nat_num_int },
+            { "NSNumber", "numberWithLong:", (void *)nat_num_int }, { "NSNumber", "numberWithUnsignedInteger:", (void *)nat_num_int },
+            { "NSNumber", "numberWithBool:", (void *)nat_num_bool }, { "NSNumber", "numberWithFloat:", (void *)nat_num_float }, { "NSNumber", "numberWithDouble:", (void *)nat_num_double },
+            { "NSNumber", "intValue", (void *)nat_num_getint }, { "NSNumber", "integerValue", (void *)nat_num_getint }, { "NSNumber", "unsignedIntValue", (void *)nat_num_getint },
+            { "NSNumber", "boolValue", (void *)nat_num_getint }, { "NSNumber", "floatValue", (void *)nat_num_getfloat }, { "NSNumber", "doubleValue", (void *)nat_num_getdouble },
+            { "NSNumber", "isEqualToNumber:", (void *)nat_num_iseq }, { "NSNumber", "isEqual:", (void *)nat_num_iseq },
+            { "NSArray", "array", (void *)nat_coll_new }, { "NSArray", "arrayWithCapacity:", (void *)nat_coll_new }, { "NSArray", "arrayWithObject:", (void *)nat_arr_withobj },
+            { "NSArray", "arrayWithObjects:", (void *)nat_arr_withobjs }, { "NSArray", "initWithCapacity:", (void *)nat_self },
+            { "NSArray", "count", (void *)nat_coll_count }, { "NSArray", "objectAtIndex:", (void *)nat_arr_at }, { "NSArray", "lastObject", (void *)nat_arr_last },
+            { "NSArray", "addObject:", (void *)nat_arr_add }, { "NSArray", "addObjectsFromArray:", (void *)nat_arr_addall }, { "NSArray", "removeAllObjects", (void *)nat_arr_clear },
+            { "NSArray", "removeLastObject", (void *)nat_arr_rmlast }, { "NSArray", "removeObjectAtIndex:", (void *)nat_arr_rmat }, { "NSArray", "removeObject:", (void *)nat_arr_rmobj },
+            { "NSArray", "containsObject:", (void *)nat_arr_contains }, { "NSArray", "indexOfObject:", (void *)nat_arr_indexof },
+            { "NSArray", "countByEnumeratingWithState:objects:count:", (void *)nat_coll_enum },
+            { "NSDictionary", "dictionary", (void *)nat_coll_new }, { "NSDictionary", "dictionaryWithCapacity:", (void *)nat_coll_new }, { "NSDictionary", "initWithCapacity:", (void *)nat_self },
+            { "NSDictionary", "dictionaryWithObjectsAndKeys:", (void *)nat_dict_withkv }, { "NSDictionary", "count", (void *)nat_coll_count },
+            { "NSDictionary", "objectForKey:", (void *)nat_dict_get }, { "NSDictionary", "valueForKey:", (void *)nat_dict_get }, { "NSDictionary", "setObject:forKey:", (void *)nat_dict_set },
+            { "NSDictionary", "removeObjectForKey:", (void *)nat_dict_rm }, { "NSDictionary", "allKeys", (void *)nat_dict_keys }, { "NSDictionary", "allValues", (void *)nat_dict_vals },
+            { "NSDictionary", "countByEnumeratingWithState:objects:count:", (void *)nat_coll_enum },
+            { "NSUserDefaults", "standardUserDefaults", (void *)nat_ud_standard }, { "NSUserDefaults", "objectForKey:", (void *)nat_dict_get }, { "NSUserDefaults", "stringForKey:", (void *)nat_dict_get },
+            { "NSUserDefaults", "arrayForKey:", (void *)nat_dict_get }, { "NSUserDefaults", "dictionaryForKey:", (void *)nat_dict_get }, { "NSUserDefaults", "integerForKey:", (void *)nat_ud_int },
+            { "NSUserDefaults", "boolForKey:", (void *)nat_ud_int }, { "NSUserDefaults", "floatForKey:", (void *)nat_ud_float }, { "NSUserDefaults", "setObject:forKey:", (void *)nat_dict_set },
+            { "NSUserDefaults", "setInteger:forKey:", (void *)nat_ud_setint }, { "NSUserDefaults", "setBool:forKey:", (void *)nat_ud_setbool }, { "NSUserDefaults", "setFloat:forKey:", (void *)nat_ud_setfloat },
+            { "NSUserDefaults", "removeObjectForKey:", (void *)nat_dict_rm }, { "NSUserDefaults", "synchronize", (void *)nat_one }, { "NSUserDefaults", "registerDefaults:", (void *)nat_zero },
+            { "NSBundle", "mainBundle", (void *)nat_bundle_main }, { "NSBundle", "bundlePath", (void *)nat_bundle_path }, { "NSBundle", "resourcePath", (void *)nat_bundle_path },
+            { "NSBundle", "infoDictionary", (void *)nat_bundle_info }, { "NSBundle", "objectForInfoDictionaryKey:", (void *)nat_bundle_infokey }, { "NSBundle", "bundleIdentifier", (void *)nat_bundle_id },
+            { "NSBundle", "pathForResource:ofType:", (void *)nat_bundle_res }, { "NSBundle", "pathForResource:ofType:inDirectory:", (void *)nat_bundle_res },
+            { "NSFileManager", "defaultManager", (void *)nat_fm_default }, { "NSFileManager", "fileExistsAtPath:", (void *)nat_fm_exists },
+            { "NSLocale", "preferredLanguages", (void *)nat_locale_langs },
+            { "NSNotificationCenter", "defaultCenter", (void *)nat_singleton_nc }, { "NSNotificationCenter", "addObserver:selector:name:object:", (void *)nat_zero },
+            { "NSNotificationCenter", "removeObserver:", (void *)nat_zero }, { "NSNotificationCenter", "postNotificationName:object:", (void *)nat_zero },
+            { "UIScreen", "mainScreen", (void *)nat_singleton_screen }, { "UIScreen", "bounds", (void *)nat_screen_bounds }, { "UIScreen", "applicationFrame", (void *)nat_screen_bounds },
+            { "UIScreen", "scale", (void *)nat_screen_scale },
+            { "UIDevice", "currentDevice", (void *)nat_singleton_device }, { "UIDevice", "systemVersion", (void *)nat_dev_ver }, { "UIDevice", "model", (void *)nat_dev_model },
+            { "UIDevice", "name", (void *)nat_dev_model }, { "UIDevice", "systemName", (void *)nat_dev_sysname }, { "UIDevice", "uniqueIdentifier", (void *)nat_dev_uid },
+            { "UIDevice", "userInterfaceIdiom", (void *)nat_dev_idiom },
+            { "EAGLContext", "setCurrentContext:", (void *)nat_one }, { "EAGLContext", "initWithAPI:", (void *)nat_self }, { "EAGLContext", "initWithAPI:sharegroup:", (void *)nat_self },
+            { "EAGLContext", "renderbufferStorage:fromDrawable:", (void *)nat_one }, { "EAGLContext", "presentRenderbuffer:", (void *)nat_one },
             { NULL, NULL, NULL }
           };
           static U find_native(U cls, const char *sel) {
@@ -1316,7 +1667,6 @@ jobs:
           static U sh_object_getClass(U o) { return o ? M32(o) : 0; }
           static U sh_class_getSuperclass(U c) { return c ? M32(c + 4) : 0; }
           static U sh_class_getInstanceSize(U c) { ClsInfo *ci = ci_of(c); return ci ? ci->instsize : 0; }
-          static int sh_NSLog(U fmt, ...) { const char *s = cfstr(fmt); L("[NSLog] %s\n", s ? s : "(format bukan string konstan)"); return 0; }
           static U sh_NSClassFromString(U s) { const char *n = cfstr(s); return n ? class_by_name(n) : 0; }
 
           static U sh_UIApplicationMain(int argc, char **argv, U principal, U delegate) {
@@ -1484,6 +1834,7 @@ jobs:
             FN("_object_getClass", sh_object_getClass), FN("_class_getSuperclass", sh_class_getSuperclass), FN("_class_getInstanceSize", sh_class_getInstanceSize),
             FN("_NSLog", sh_NSLog), FN("_NSClassFromString", sh_NSClassFromString), FN("_NSSetUncaughtExceptionHandler", sh_zero),
             FN("_UIApplicationMain", sh_UIApplicationMain),
+            FN("_NSSearchPathForDirectoriesInDomains", sh_NSSearchPath), FN("_NSTemporaryDirectory", sh_NSTemporaryDirectory), FN("_NSStringFromClass", sh_NSStringFromClass),
           #ifdef __arm__
             FN("_objc_msgSend", objc_msgSend_asm), FN("_objc_msgSend_stret", objc_msgSend_stret_asm), FN("_objc_msgSendSuper2", objc_msgSendSuper2_asm),
             FN("_setjmp", sh_setjmp), FN("_longjmp", sh_longjmp),
@@ -1815,6 +2166,7 @@ jobs:
             if (ctors) alarm((unsigned)timeout);
           #endif
             atexit(print_summary);
+            init_paths();
             L("\n[2b] runtime ObjC\n");
           #ifdef __arm__
             g_phase = "objc_setup";
