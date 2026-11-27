@@ -1,4 +1,4 @@
-name: build-armhf-luxor2-ios-diagnostic-m10h
+name: build-armhf-luxor2-ios-diagnostic-m10i
 on:
   workflow_dispatch:
   push:
@@ -2477,21 +2477,47 @@ jobs:
           }
 
           /* ===== M8l: log fopen game (cari file binding input yang gagal dimuat) ===== */
-          /* M10h: pantau apakah file musik terus dibaca (streaming) atau berhenti */
+          /* M10i: lacak operasi file musik (baca/seek/tutup) untuk mencari kenapa streaming BGM tidak berbunyi */
           static FILE *volatile g_mus[16]; static volatile unsigned long g_mus_bytes, g_mus_reads;
+          static struct { char nm[24]; unsigned long reads, bytes, seeks, seek_err, shorts; int logged; } g_mi[16];
+          static int mus_slot(FILE *f) { int i; if (f) for (i = 0; i < 16; i++) if (g_mus[i] == f) return i; return -1; }
+          static void mus_open(FILE *f, const char *p) {
+            int i; const char *b = strrchr(p, '/');
+            for (i = 0; i < 16; i++) if (!g_mus[i]) {
+              memset(&g_mi[i], 0, sizeof g_mi[i]); snprintf(g_mi[i].nm, sizeof g_mi[i].nm, "%s", b ? b + 1 : p); g_mus[i] = f;
+              L("[mus] buka #%d %s f=%08x thread=%08x\n", i, g_mi[i].nm, (unsigned)(uintptr_t)f, (unsigned)pthread_self()); return;
+            }
+            L("[mus] slot penuh: %s\n", p);
+          }
           static size_t sh_fread(void *d, size_t s, size_t n, FILE *f) {
-            size_t r = fread(d, s, n, f); int i;
-            for (i = 0; i < 16; i++) if (f && g_mus[i] == f) { g_mus_bytes += r * s; g_mus_reads++; break; }
+            int i = mus_slot(f); long at = i >= 0 ? ftell(f) : 0; size_t r = fread(d, s, n, f);
+            if (i >= 0) {
+              g_mus_bytes += r * s; g_mus_reads++; g_mi[i].reads++; g_mi[i].bytes += r * s; if (r != n) g_mi[i].shorts++;
+              if (g_mi[i].logged < 40) { g_mi[i].logged++; L("[mus] #%d %s baca pos=%ld %ux%u -> %u eof=%d err=%d thread=%08x\n", i, g_mi[i].nm, at, (unsigned)s, (unsigned)n, (unsigned)r, feof(f), ferror(f), (unsigned)pthread_self()); }
+            }
             return r;
           }
-          static int sh_fclose(FILE *f) { int i; for (i = 0; i < 16; i++) if (g_mus[i] == f) g_mus[i] = 0; return fclose(f); }
+          static int sh_fseek(FILE *f, long off, int wh) {
+            int i = mus_slot(f), r = fseek(f, off, wh);
+            if (i >= 0) { g_mi[i].seeks++; if (r) g_mi[i].seek_err++; if (g_mi[i].logged < 40) { g_mi[i].logged++; L("[mus] #%d %s seek off=%ld wh=%d -> %d pos=%ld\n", i, g_mi[i].nm, off, wh, r, ftell(f)); } }
+            return r;
+          }
+          static int sh_fclose(FILE *f) {
+            int i = mus_slot(f);
+            if (i >= 0) { L("[mus] tutup #%d %s baca=%lu byte=%lu seek=%lu\n", i, g_mi[i].nm, g_mi[i].reads, g_mi[i].bytes, g_mi[i].seeks); g_mus[i] = 0; }
+            return fclose(f);
+          }
+          static void mus_report(void) {
+            int i;
+            for (i = 0; i < 16; i++) if (g_mus[i]) L("[mus] #%d %s: baca=%lu byte=%lu pendek=%lu seek=%lu gagal=%lu pos=%ld\n", i, g_mi[i].nm, g_mi[i].reads, g_mi[i].bytes, g_mi[i].shorts, g_mi[i].seeks, g_mi[i].seek_err, ftell(g_mus[i]));
+          }
           static FILE *sh_fopen(const char *p, const char *m) {
             static int n; FILE *f = fopen(p, m);
             if (!f && p && p[0] != '/') {    /* fallback case-insensitive di folder kerja */
               char buf[1024]; const char *base = strrchr(p, '/'); (void)base;
               snprintf(buf, sizeof buf, "%s/%s", g_app_dir, p); f = fopen(buf, m);
             }
-            if (f && p && strstr(p, "data/music/")) { int i; for (i = 0; i < 16; i++) if (!g_mus[i]) { g_mus[i] = f; break; } }
+            if (f && p && strstr(p, "data/music/")) mus_open(f, p);
             { static int na; if (f && p && na < 80 && (strstr(p, ".ogg") || strstr(p, ".mp3") || strstr(p, ".m4a") || strstr(p, ".mo3") || strstr(p, "music") || strstr(p, ".mjz"))) { na++; L("[fopen] audio/arsip OK \"%s\"\n", p); } }
             if (!f && p && strncmp(p, "locale/", 7) && n < 100) { n++; L("[fopen] GAGAL \"%s\" (%s)\n", p, m ? m : ""); }
             return f;
@@ -2511,7 +2537,7 @@ jobs:
           static uint8_t *g_rb; static volatile uint32_t g_rb_w, g_rb_r; static uint32_t g_rb_n;
           static volatile int g_au_thr; static unsigned long g_au_under, g_au_calls; static double g_au_maxms;
           /* M10g: rekam keluaran FMOD ke audio_dump.wav + statistik, untuk memisahkan masalah data vs perangkat */
-          static void au_dump(const uint8_t *p, int frames) {
+          static void au_dump(const uint8_t *p, int frames) {   /* M10i */
             static int fd = -2; static uint32_t done, lim, mark, nz, clip, jump; static int peak, last;
             int fb = g_au_ch * g_au_bytes, i; uint32_t rate = (uint32_t)g_au_rate;
             if (fd == -2) {
@@ -2528,7 +2554,7 @@ jobs:
               }
             }
             mark += (uint32_t)frames;
-            if (mark >= rate * 5u) { L("[au] isi 5 detik: puncak=%d tidak_nol=%u/%u klip=%u loncatan=%u\n", peak, nz, mark, clip, jump); mark = nz = clip = jump = 0; peak = 0; L("[au] musik: dibaca %lu byte dalam %lu kali\n", g_mus_bytes, g_mus_reads); }
+            if (mark >= rate * 5u) { L("[au] isi 5 detik: puncak=%d tidak_nol=%u/%u klip=%u loncatan=%u\n", peak, nz, mark, clip, jump); mark = nz = clip = jump = 0; peak = 0; L("[au] musik: dibaca %lu byte dalam %lu kali\n", g_mus_bytes, g_mus_reads); mus_report(); }
             if (fd >= 0 && done < lim) {
               uint32_t before = done / rate, h[11];
               if (write(fd, p, (size_t)(frames * fb)) != (ssize_t)(frames * fb)) { close(fd); fd = -1; return; }
@@ -2690,7 +2716,7 @@ jobs:
             FN("_glCheckFramebufferStatusOES", sh_glCheckFramebufferStatus), FN("_glCheckFramebufferStatus", sh_glCheckFramebufferStatus),
             FN("_glFramebufferRenderbufferOES", sh_glFramebufferRenderbuffer), FN("_glFramebufferRenderbuffer", sh_glFramebufferRenderbuffer),
             FN("_glGetRenderbufferParameterivOES", sh_glGetRenderbufferParameteriv), FN("_glGetRenderbufferParameteriv", sh_glGetRenderbufferParameteriv),
-            FN("_fopen", sh_fopen), FN("_fread", sh_fread), FN("_fclose", sh_fclose), FN("_AudioSessionInitialize", sh_AudioSessionInitialize), FN("_AudioSessionSetActive", sh_AudioSessionSetActive),
+            FN("_fopen", sh_fopen), FN("_fread", sh_fread), FN("_fseek", sh_fseek), FN("_fclose", sh_fclose), FN("_AudioSessionInitialize", sh_AudioSessionInitialize), FN("_AudioSessionSetActive", sh_AudioSessionSetActive),
             FN("_AudioSessionAddPropertyListener", sh_AudioSessionAddPropertyListener), FN("_AudioSessionSetProperty", sh_AudioSessionSetProperty), FN("_AudioSessionGetProperty", sh_AudioSessionGetProperty),
             FN("_AudioComponentFindNext", sh_AudioComponentFindNext), FN("_AudioComponentInstanceNew", sh_AudioComponentInstanceNew), FN("_AudioComponentInstanceDispose", sh_AudioComponentInstanceDispose),
             FN("_AudioUnitSetProperty", sh_AudioUnitSetProperty), FN("_AudioUnitGetProperty", sh_AudioUnitGetProperty), FN("_AudioUnitInitialize", sh_AudioUnitInitialize), FN("_AudioUnitUninitialize", sh_AudioUnitUninitialize),
@@ -2765,7 +2791,7 @@ jobs:
               if (!strcmp(shim_tab[i].name, name)) {
               *how = shim_tab[i].kind;
               /* M6f: shim GL (C kita) bisa tail-call langsung ke libmali -> wajib masuk dengan sp 8-aligned */
-              if (shim_tab[i].kind == H_WRAP && (!strncmp(name, "_gl", 3) || !strncmp(name, "_Audio", 6) || !strcmp(name, "_pthread_create") || !strcmp(name, "_fread") || !strcmp(name, "_fclose"))) return align_wrap(shim_tab[i].addr);   /* M10b: audio juga (ALSA pakai NEON) */
+              if (shim_tab[i].kind == H_WRAP && (!strncmp(name, "_gl", 3) || !strncmp(name, "_Audio", 6) || !strcmp(name, "_pthread_create") || !strcmp(name, "_fread") || !strcmp(name, "_fclose") || !strcmp(name, "_fseek"))) return align_wrap(shim_tab[i].addr);   /* M10b: audio juga (ALSA pakai NEON) */
               return shim_tab[i].addr;
             }
             for (i = 0; pass_tab[i]; i++)
